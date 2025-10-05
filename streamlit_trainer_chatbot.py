@@ -1,103 +1,147 @@
 # Import the necessary libraries
-import streamlit as st  # For creating the web app interface
-from google import genai  # For interacting with the Google Gemini API
+import streamlit as st
+import os
+import tempfile
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain.prompts import PromptTemplate
+from langchain.schema.runnable import RunnablePassthrough
+from langchain.schema.output_parser import StrOutputParser
+from langchain_community.vectorstores import FAISS
+from langchain_community.document_loaders import PyPDFLoader, TextLoader, MarkdownLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # --- 1. Page Configuration and Title ---
+st.set_page_config(page_title="FitBot RAG", page_icon="🤖")
+st.title("🤖 FitBot dengan RAG")
+st.caption("Chatbot ini menjawab pertanyaan berdasarkan dokumen yang Anda unggah.")
 
-# Set the title and a caption for the web page
-st.title("💬 Gemini Chatbot")
-st.caption("A simple and friendly chat using Google's Gemini Flash model")
-
-# --- 2. Sidebar for Settings ---
-
-# The sidebar is now simpler, only containing the reset button.
-with st.sidebar:
-    st.subheader("Controls")
-    # Create a button to reset the conversation.
-    reset_button = st.button("Reset Conversation", help="Clear all messages and start fresh")
-
-# --- 3. API Key and Client Initialization (MODIFIED SECTION) ---
-
-# Get the API key from Streamlit's secrets management.
-# This is the secure and recommended way to handle API keys.
+# --- 2. API Key Configuration ---
 try:
     google_api_key = st.secrets["GOOGLE_API_KEY"]
 except KeyError:
-    # If the key is not found in secrets, show an error and stop.
     st.error("Google AI API Key not found. Please add it to your Streamlit secrets.", icon="🗝️")
     st.stop()
 
-# Initialize the Gemini client.
-# This block now only runs once per session since the key doesn't change.
-if "genai_client" not in st.session_state:
+# --- 3. Sidebar for File Upload ---
+with st.sidebar:
+    st.header("Konfigurasi")
+    uploaded_file = st.file_uploader(
+        "Unggah Basis Pengetahuan Anda (PDF, TXT, MD)", 
+        type=["pdf", "txt", "md"]
+    )
+
+# --- Functions for RAG Chain ---
+
+# Fungsi ini di-cache agar tidak perlu membuat ulang vector store setiap saat
+@st.cache_resource
+def create_vector_store(uploaded_file_bytes, file_name):
+    """Membuat vector store dari file yang diunggah."""
     try:
-        # Configure and create the Gemini client.
-        st.session_state.genai_client = genai.Client(api_key=google_api_key)
+        # Save the uploaded file to a temporary location
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file_name)[1]) as tmp_file:
+            tmp_file.write(uploaded_file_bytes)
+            tmp_file_path = tmp_file.name
+
+        # Load the document based on its extension
+        if file_name.endswith(".pdf"):
+            loader = PyPDFLoader(tmp_file_path)
+        elif file_name.endswith(".txt"):
+            loader = TextLoader(tmp_file_path)
+        elif file_name.endswith(".md"):
+            loader = MarkdownLoader(tmp_file_path)
+        else:
+            st.error("Format file tidak didukung.")
+            return None
+        
+        documents = loader.load()
+
+        # Split the document into chunks
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+        docs = text_splitter.split_documents(documents)
+
+        # Create embeddings
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=google_api_key)
+        
+        # Create FAISS vector store
+        vector_store = FAISS.from_documents(docs, embeddings)
+        
+        # Clean up the temporary file
+        os.remove(tmp_file_path)
+        
+        st.success(f"Basis pengetahuan dari '{file_name}' berhasil dibuat!")
+        return vector_store
+
     except Exception as e:
-        # If the key is invalid or another error occurs, show an error and stop.
-        st.error(f"Failed to initialize Gemini client: {e}")
-        st.stop()
+        st.error(f"Gagal memproses file: {e}")
+        return None
 
-# --- 4. Chat History Management ---
+# --- Main Application Logic ---
 
-# Initialize the chat session if it doesn't already exist in memory.
-if "chat" not in st.session_state:
-    # Create a new chat instance using the 'gemini-1.5-flash' model.
-    st.session_state.chat = st.session_state.genai_client.chats.create(model="gemini-2.5-flash")
+# Inisialisasi retriever di session state
+if "retriever" not in st.session_state:
+    st.session_state.retriever = None
 
-# Initialize the message history (as a list) if it doesn't exist.
+if uploaded_file:
+    # Buat vector store saat file baru diunggah
+    uploaded_file_bytes = uploaded_file.getvalue()
+    vector_store = create_vector_store(uploaded_file_bytes, uploaded_file.name)
+    if vector_store:
+        st.session_state.retriever = vector_store.as_retriever()
+else:
+    st.info("Silakan unggah file di sidebar untuk memulai.")
+    st.stop()
+
+# Initialize chat history
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Handle the reset button click.
-if reset_button:
-    # If the reset button is clicked, clear the chat object and message history from memory.
-    st.session_state.pop("chat", None)
-    st.session_state.pop("messages", None)
-    # st.rerun() tells Streamlit to refresh the page from the top.
-    st.rerun()
+# Display chat messages from history on app rerun
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
 
-# --- 5. Display Past Messages ---
+# --- RAG Chain and User Interaction ---
+if st.session_state.retriever:
+    # Define the LLM
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=google_api_key, temperature=0.7)
 
-# Loop through every message currently stored in the session state.
-for msg in st.session_state.messages:
-    # For each message, create a chat message bubble with the appropriate role ("user" or "assistant").
-    with st.chat_message(msg["role"]):
-        # Display the content of the message using Markdown for nice formatting.
-        st.markdown(msg["content"])
+    # Define the prompt template
+    prompt_template = """
+    Anda adalah asisten AI yang ahli dalam konten dokumen yang diberikan.
+    Jawab pertanyaan pengguna hanya berdasarkan konteks berikut.
+    Jika Anda tidak tahu jawabannya dari konteks yang diberikan, katakan "Saya tidak menemukan informasi tersebut di dalam dokumen."
+    Jawablah selalu dalam Bahasa Indonesia.
 
-# --- 6. Handle User Input and API Communication ---
+    Konteks:
+    {context}
 
-# Create a chat input box at the bottom of the page.
-# The user's typed message will be stored in the 'prompt' variable.
-prompt = st.chat_input("Type your message here...")
+    Pertanyaan:
+    {question}
+    """
+    prompt = PromptTemplate.from_template(prompt_template)
 
-if prompt:
-    # 1. Add the user's message to our message history list.
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    # 2. Display the user's message on the screen immediately for a responsive feel.
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    # Create the RAG chain
+    rag_chain = (
+        {"context": st.session_state.retriever, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
 
-    # 3. Get the assistant's response.
-    # Use a 'try...except' block to gracefully handle potential errors.
-    try:
-        # Send the user's prompt to the Gemini API.
-        response = st.session_state.chat.send_message(prompt)
+    # React to user input
+    if user_prompt := st.chat_input("Tanyakan sesuatu tentang dokumen Anda..."):
+        # Display user message in chat message container
+        with st.chat_message("user"):
+            st.markdown(user_prompt)
+        # Add user message to chat history
+        st.session_state.messages.append({"role": "user", "content": user_prompt})
+
+        # Get assistant response from the RAG chain
+        with st.spinner("FitBot sedang berpikir..."):
+            response = rag_chain.invoke(user_prompt)
         
-        # Safely get the text from the response object.
-        if hasattr(response, "text"):
-            answer = response.text
-        else:
-            answer = str(response)
-
-    except Exception as e:
-        # If any error occurs, create an error message to display to the user.
-        answer = f"An error occurred: {e}"
-        st.error(answer) # Show error in the app UI as well
-
-    # 4. Display the assistant's response.
-    with st.chat_message("assistant"):
-        st.markdown(answer)
-    # 5. Add the assistant's response to the message history list.
-    st.session_state.messages.append({"role": "assistant", "content": answer})
+        # Display assistant response in chat message container
+        with st.chat_message("assistant"):
+            st.markdown(response)
+        # Add assistant response to chat history
+        st.session_state.messages.append({"role": "assistant", "content": response})
